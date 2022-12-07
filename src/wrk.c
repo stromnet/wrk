@@ -253,6 +253,7 @@ static int connect_socket(thread *thread, connection *c) {
         if (errno != EINPROGRESS) goto error;
     }
 
+    c->connect_start = time_us();
     flags = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
 
@@ -273,7 +274,7 @@ static int reconnect_socket(thread *thread, connection *c) {
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
     sock.close(c);
     close(c->fd);
-    c->connected = 0;
+    c->connect_time = 0;
     return connect_socket(thread, c);
 }
 
@@ -352,11 +353,12 @@ static int response_complete(http_parser *parser) {
             thread->errors.timeout++;
         }
         // Only record if new connection was made
-        uint64_t connection_time = c->connected != 0 && now - c->connected;
-        if (connection_time && !stats_record(statistics.connect, connection_time)) {
+        if(c->connect_time > 0) {
+          if (!stats_record(statistics.connect, c->connect_time)) {
             thread->errors.timeout++; // TODO
+          }
+          c->connect_time = 0;
         }
-        c->connected = 0;
         c->delayed = cfg.delay;
         aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
     }
@@ -383,7 +385,7 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
 
     http_parser_init(&c->parser, HTTP_RESPONSE);
     c->written = 0;
-    c->connected = time_us();
+    c->connect_time = time_us() - c->connect_start;
 
     aeCreateFileEvent(c->thread->loop, fd, AE_READABLE, socket_readable, c);
     aeCreateFileEvent(c->thread->loop, fd, AE_WRITABLE, socket_writeable, c);
@@ -558,7 +560,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
 }
 
 static void print_stats_header() {
-    printf("  Thread Stats%6s%11s%8s%12s\n", "Avg", "Stdev", "Max", "+/- Stdev");
+    printf("  Thread Stats%6s%11s%8s%10s%12s\n", "Avg", "Stdev", "Max", "Count", "+/- Stdev");
 }
 
 static void print_units(long double n, char *(*fmt)(long double), int width) {
@@ -576,6 +578,7 @@ static void print_units(long double n, char *(*fmt)(long double), int width) {
 
 static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
     uint64_t max = stats->max;
+    uint64_t count = stats->count;
     long double mean  = stats_mean(stats);
     long double stdev = stats_stdev(stats, mean);
 
@@ -583,6 +586,7 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
     print_units(mean,  fmt, 8);
     print_units(stdev, fmt, 10);
     print_units(max,   fmt, 9);
+    printf("    %-6lu", count);
     printf("%8.2Lf%%\n", stats_within_stdev(stats, mean, stdev, 1));
 }
 
