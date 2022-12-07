@@ -20,6 +20,7 @@ static struct config {
 
 static struct {
     stats *latency;
+    stats *connect;
     stats *requests;
 } statistics;
 
@@ -89,6 +90,7 @@ int main(int argc, char **argv) {
     signal(SIGINT,  SIG_IGN);
 
     statistics.latency  = stats_alloc(cfg.timeout * 1000);
+    statistics.connect  = stats_alloc(cfg.timeout * 1000);
     statistics.requests = stats_alloc(MAX_THREAD_RATE_S);
     thread *threads     = zcalloc(cfg.threads * sizeof(thread));
 
@@ -172,8 +174,12 @@ int main(int argc, char **argv) {
 
     print_stats_header();
     print_stats("Latency", statistics.latency, format_time_us);
+    print_stats("Connection", statistics.connect, format_time_us);
     print_stats("Req/Sec", statistics.requests, format_metric);
-    if (cfg.latency) print_stats_latency(statistics.latency);
+    if (cfg.latency) {
+      print_stats_latency("Latency", statistics.latency);
+      print_stats_latency("Connect", statistics.connect);
+    }
 
     char *runtime_msg = format_time_us(runtime_us);
 
@@ -267,6 +273,7 @@ static int reconnect_socket(thread *thread, connection *c) {
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
     sock.close(c);
     close(c->fd);
+    c->connected = 0;
     return connect_socket(thread, c);
 }
 
@@ -344,6 +351,12 @@ static int response_complete(http_parser *parser) {
         if (!stats_record(statistics.latency, now - c->start)) {
             thread->errors.timeout++;
         }
+        // Only record if new connection was made
+        uint64_t connection_time = c->connected != 0 && now - c->connected;
+        if (connection_time && !stats_record(statistics.connect, connection_time)) {
+            thread->errors.timeout++; // TODO
+        }
+        c->connected = 0;
         c->delayed = cfg.delay;
         aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
     }
@@ -370,6 +383,7 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
 
     http_parser_init(&c->parser, HTTP_RESPONSE);
     c->written = 0;
+    c->connected = time_us();
 
     aeCreateFileEvent(c->thread->loop, fd, AE_READABLE, socket_readable, c);
     aeCreateFileEvent(c->thread->loop, fd, AE_WRITABLE, socket_writeable, c);
@@ -572,9 +586,9 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
     printf("%8.2Lf%%\n", stats_within_stdev(stats, mean, stdev, 1));
 }
 
-static void print_stats_latency(stats *stats) {
+static void print_stats_latency(char *name, stats *stats) {
     long double percentiles[] = { 50.0, 75.0, 90.0, 99.0 };
-    printf("  Latency Distribution\n");
+    printf("  %s Distribution\n", name);
     for (size_t i = 0; i < sizeof(percentiles) / sizeof(long double); i++) {
         long double p = percentiles[i];
         uint64_t n = stats_percentile(stats, p);
